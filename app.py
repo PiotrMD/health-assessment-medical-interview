@@ -1,8 +1,21 @@
+import smtplib
+import tempfile
+from datetime import date, datetime
+from email.message import EmailMessage
+from typing import Any, Dict, List
+
 import streamlit as st
 import streamlit.components.v1 as components
-from datetime import date
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
     page_title="Health Assessment - Medical Interview",
     layout="centered",
@@ -84,7 +97,26 @@ st.markdown(
 )
 
 
-def nonempty(value):
+# =========================================================
+# SECRETS
+# =========================================================
+def get_secret(name: str) -> str:
+    if name not in st.secrets:
+        st.error(f"Missing secret: {name}")
+        st.stop()
+    return st.secrets[name]
+
+
+EMAIL_USER = get_secret("EMAIL_USER")
+EMAIL_PASSWORD = get_secret("EMAIL_PASSWORD")
+EMAIL_RECEIVER = get_secret("EMAIL_RECEIVER")
+EMAIL_RECEIVER_2 = get_secret("EMAIL_RECEIVER_2")
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def nonempty(value: Any) -> bool:
     if value is None:
         return False
     if isinstance(value, str):
@@ -94,6 +126,18 @@ def nonempty(value):
     if isinstance(value, bool):
         return value
     return True
+
+
+def safe(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    return str(value).strip()
+
+
+def list_text(values: List[str]) -> str:
+    return ", ".join([v for v in values if v])
 
 
 def validate_phone(raw: str):
@@ -160,6 +204,186 @@ def calc_progress(values):
     return int(round((filled / len(values)) * 100))
 
 
+def add_pdf_section(story, title: str, rows: List[str], styles_dict):
+    clean_rows = [r for r in rows if nonempty(r)]
+    story.append(Paragraph(title, styles_dict["section"]))
+    story.append(Spacer(1, 2.2 * mm))
+
+    if clean_rows:
+        for row in clean_rows:
+            story.append(Paragraph(row.replace("\n", "<br/>"), styles_dict["body"]))
+            story.append(Spacer(1, 1.2 * mm))
+    else:
+        story.append(Paragraph("No data.", styles_dict["body"]))
+        story.append(Spacer(1, 1.2 * mm))
+
+    story.append(Spacer(1, 2.5 * mm))
+
+
+class NumberedCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        page_count = len(self._saved_page_states) + 1
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_page_number(page_count)
+            super().showPage()
+        self.draw_page_number(page_count)
+        super().save()
+
+    def draw_page_number(self, page_count: int):
+        self.setFont("Helvetica", 9)
+        self.drawCentredString(A4[0] / 2, 10 * mm, f"Page {self._pageNumber} / {page_count}")
+
+
+def make_pdf(data: Dict[str, Any]) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.close()
+
+    doc = SimpleDocTemplate(
+        tmp.name,
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=14 * mm,
+        bottomMargin=18 * mm,
+    )
+
+    base = getSampleStyleSheet()
+    styles_dict = {
+        "title_big": ParagraphStyle(
+            "TitleBig",
+            parent=base["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=19,
+            spaceAfter=1.5 * mm,
+        ),
+        "title_mid": ParagraphStyle(
+            "TitleMid",
+            parent=base["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=12,
+            leading=15,
+            spaceAfter=2 * mm,
+        ),
+        "doctor": ParagraphStyle(
+            "Doctor",
+            parent=base["Normal"],
+            fontName="Helvetica",
+            fontSize=10.5,
+            leading=13,
+            spaceAfter=2 * mm,
+        ),
+        "section": ParagraphStyle(
+            "Section",
+            parent=base["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            leading=14,
+            spaceBefore=2 * mm,
+            spaceAfter=1.5 * mm,
+        ),
+        "body": ParagraphStyle(
+            "Body",
+            parent=base["Normal"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=12,
+        ),
+    }
+
+    story = []
+    story.append(Paragraph("HEALTH ASSESSMENT", styles_dict["title_big"]))
+    story.append(Paragraph("Medical Interview", styles_dict["title_mid"]))
+    story.append(Paragraph("dr n. med. Piotr Niedziałkowski", styles_dict["doctor"]))
+    story.append(Paragraph("www.ocenazdrowia.pl", styles_dict["doctor"]))
+    story.append(Spacer(1, 1 * mm))
+
+    add_pdf_section(
+        story,
+        "Identification data",
+        [
+            f"Patient: {data['first_name']} {data['last_name']}",
+            f"Phone number: {data['phone']}",
+            f"Email address: {data['email']}",
+            f"Date of birth: {data['birth_date']}",
+            f"Visit type: {data['visit_type']}",
+            f"Submission date and time: {data['submitted_at']}",
+        ],
+        styles_dict,
+    )
+
+    ordered_sections = [
+        ("Basic information", data["sec_basic"]),
+        ("General assessment", data["sec_overall"]),
+        ("Tests performed in the last 2 years", data["sec_tests"]),
+        ("Main symptoms", data["sec_main_symptoms"]),
+        ("Other symptoms", data["sec_other_symptoms"]),
+        ("Symptom pattern", data["sec_symptom_character"]),
+        ("Health timeline and medications", data["sec_timeline_meds"]),
+        ("Lifestyle", data["sec_lifestyle"]),
+        ("Travel", data["sec_travel"]),
+        ("Animals", data["sec_animals"]),
+        ("Injuries", data["sec_injuries"]),
+        ("COVID-19", data["sec_covid"]),
+        ("Stress", data["sec_stress"]),
+        ("Birth and childhood", data["sec_birth_childhood"]),
+        ("General and neurological symptoms", data["sec_general_neuro"]),
+        ("Respiratory system", data["sec_respiratory"]),
+        ("Cardiovascular system", data["sec_cardio"]),
+        ("Gastrointestinal tract", data["sec_gi"]),
+        ("Urinary system", data["sec_urinary"]),
+        ("Joints and muscles", data["sec_msk"]),
+        ("Skin", data["sec_skin"]),
+        ("Sleep and mental health", data["sec_sleep_psych"]),
+        ("Peripheral circulation", data["sec_peripheral"]),
+        ("Anal and perianal area", data["sec_anal"]),
+        ("Gynecology or andrology", data["sec_sex_specific"]),
+        ("Family history", data["sec_family"]),
+        ("Previous diagnoses, surgeries and important information", data["sec_history_final"]),
+        ("Most important question for the doctor", data["sec_question"]),
+    ]
+
+    for section_title, section_rows in ordered_sections:
+        add_pdf_section(story, section_title, section_rows, styles_dict)
+
+    doc.build(story, canvasmaker=NumberedCanvas)
+    return tmp.name
+
+
+def send_email_with_pdf(subject: str, body_text: str, pdf_path: str):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_USER
+    msg["To"] = f"{EMAIL_RECEIVER}, {EMAIL_RECEIVER_2}"
+    msg.set_content(body_text)
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename="medical_interview_report.pdf",
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_USER, EMAIL_PASSWORD)
+        smtp.send_message(msg)
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
 if "field_errors" not in st.session_state:
     st.session_state.field_errors = {}
 if "scroll_target" not in st.session_state:
@@ -168,6 +392,10 @@ if "scroll_target" not in st.session_state:
 field_errors = st.session_state.field_errors
 progress_placeholder = st.empty()
 
+
+# =========================================================
+# HEADER
+# =========================================================
 st.title("Health Assessment")
 st.subheader("Medical Interview")
 st.write("dr n. med. Piotr Niedziałkowski")
@@ -189,6 +417,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+# =========================================================
+# FORM
+# =========================================================
 with st.form("medical_interview_form"):
     with st.expander("1. Basic information", expanded=True):
         visit_type = st.radio("Visit type", ["First visit", "Follow-up visit"], key="visit_type")
@@ -609,6 +841,7 @@ if send_clicked:
     first_name_clean = st.session_state.get("first_name", "").strip()
     last_name_clean = st.session_state.get("last_name", "").strip()
     phone_raw = st.session_state.get("phone", "").strip()
+    email_clean = st.session_state.get("email", "").strip()
     validated_phone = validate_phone(phone_raw)
 
     if not first_name_clean:
@@ -634,17 +867,212 @@ if send_clicked:
                 break
         st.rerun()
 
-    st.success("The medical interview has been completed successfully.")
+    submitted_at = datetime.now().strftime("%d.%m.%Y, %H:%M")
+    main_symptoms_list = [x for x in [symptom_1, symptom_2, symptom_3, symptom_4, symptom_5] if nonempty(x)]
 
-    st.markdown("<div class='summary-box'>", unsafe_allow_html=True)
-    st.write("### Summary")
-    st.write(f"**Name:** {first_name_clean} {last_name_clean}")
-    st.write(f"**Phone:** {validated_phone}")
-    st.write(f"**Visit type:** {visit_type}")
-    st.write(f"**Main symptoms:** {', '.join([x for x in [symptom_1, symptom_2, symptom_3, symptom_4, symptom_5] if nonempty(x)])}")
-    st.write(f"**Main current reason:** {current_reason}")
-    st.write(f"**Most important question:** {key_question}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    pdf_data = {
+        "first_name": first_name_clean,
+        "last_name": last_name_clean,
+        "phone": validated_phone,
+        "email": email_clean,
+        "birth_date": birth_date.strftime("%d.%m.%Y"),
+        "visit_type": visit_type,
+        "submitted_at": submitted_at,
+        "sec_basic": [
+            f"Nationality: {nationality}" if nonempty(nationality) else "",
+            f"Sex: {sex}" if nonempty(sex) else "",
+            f"Current status: {current_status}" if nonempty(current_status) else "",
+            f"Current occupation: {profession}" if nonempty(profession) else "",
+            f"Height: {height_cm} cm",
+            f"Weight: {weight_kg} kg",
+        ],
+        "sec_overall": [
+            f"Physical condition: {physical_score}/10",
+            f"Mental condition: {mental_score}/10",
+            f"Weight change: {weight_change}" + (f", approx. {weight_change_amount} kg" if nonempty(weight_change_amount) else ""),
+        ],
+        "sec_tests": [f"Performed tests: {list_text(performed_tests)}" if performed_tests else ""],
+        "sec_main_symptoms": [
+            f"Symptom 1: {symptom_1}" + (f" | since: {symptom_1_since}" if nonempty(symptom_1_since) else "") if nonempty(symptom_1) else "",
+            f"Symptom 2: {symptom_2}" + (f" | since: {symptom_2_since}" if nonempty(symptom_2_since) else "") if nonempty(symptom_2) else "",
+            f"Symptom 3: {symptom_3}" + (f" | since: {symptom_3_since}" if nonempty(symptom_3_since) else "") if nonempty(symptom_3) else "",
+            f"Symptom 4: {symptom_4}" + (f" | since: {symptom_4_since}" if nonempty(symptom_4_since) else "") if nonempty(symptom_4) else "",
+            f"Symptom 5: {symptom_5}" + (f" | since: {symptom_5_since}" if nonempty(symptom_5_since) else "") if nonempty(symptom_5) else "",
+        ],
+        "sec_other_symptoms": [additional_symptoms],
+        "sec_symptom_character": [
+            f"Pattern: {symptom_pattern}",
+            f"Periodicity: {symptom_periodicity}" if nonempty(symptom_periodicity) else "",
+            f"Similar symptoms in the past: {symptom_past}" if nonempty(symptom_past) else "",
+            f"Worsening factors: {list_text(worsening_factors)}" if worsening_factors else "",
+            f"Other worsening factors: {worsening_other}" if nonempty(worsening_other) else "",
+            f"Improvement factors: {list_text(improvement_factors)}" if improvement_factors else "",
+            f"Other improvement factors: {improvement_other}" if nonempty(improvement_other) else "",
+        ],
+        "sec_timeline_meds": [
+            f"Health timeline: {health_timeline}" if nonempty(health_timeline) else "",
+            "Current medications:" if nonempty(current_meds) else "",
+            *[x for x in current_meds.splitlines() if x.strip()],
+        ],
+        "sec_lifestyle": [
+            f"Lifestyle: {lifestyle}" if nonempty(lifestyle) else "",
+            f"Substances and habits: {list_text(stimulants)}" if stimulants else "",
+            f"Other substances: {stimulants_other}" if nonempty(stimulants_other) else "",
+            f"Sleep duration: {sleep_hours} hours" if nonempty(sleep_hours) else "",
+        ],
+        "sec_travel": [f"Travel abroad in the last 3 months: {travel_abroad}" + (f", {travel_where}" if nonempty(travel_where) else "")],
+        "sec_animals": [f"Animal contact: {animal_contact}" + (f", {animal_contact_details}" if nonempty(animal_contact_details) else "")],
+        "sec_injuries": [major_injuries],
+        "sec_covid": [f"COVID-19: {covid}" + (f", {covid_details}" if nonempty(covid_details) else "")],
+        "sec_stress": [strong_stress],
+        "sec_birth_childhood": [
+            f"Birth information: {list_text(birth_info)}" if birth_info else "",
+            f"Other birth information: {birth_info_other}" if nonempty(birth_info_other) else "",
+            f"Breastfeeding: {breastfeeding}" if nonempty(breastfeeding) else "",
+            f"Childhood conditions: {list_text(childhood_diseases)}" if childhood_diseases else "",
+            f"Other childhood conditions: {childhood_diseases_other}" if nonempty(childhood_diseases_other) else "",
+        ],
+        "sec_general_neuro": [
+            f"Fever: {fever_now}" + (f", {fever_details}" if nonempty(fever_details) else ""),
+            f"Headaches or dizziness: {headache_dizziness}" + (f", {headache_dizziness_details}" if nonempty(headache_dizziness_details) else ""),
+            f"Associated headache symptoms: {headache_assoc}" if nonempty(headache_assoc) else "",
+            f"Hearing or vision worsening: {hearing_vision}" if nonempty(hearing_vision) else "",
+            f"Attacks or sudden episodes: {attacks}" if nonempty(attacks) else "",
+            f"Sinus problems: {sinus_problems}" if nonempty(sinus_problems) else "",
+            f"Nose problems: {nose_problems}" if nonempty(nose_problems) else "",
+            f"Allergies: {allergies}" if nonempty(allergies) else "",
+            f"Cold sores: {herpes}" if nonempty(herpes) else "",
+            f"Cracks at the corners of the mouth: {mouth_corners}" if nonempty(mouth_corners) else "",
+            f"Reaction after fresh fruit or vegetables: {fresh_food_reaction}" if nonempty(fresh_food_reaction) else "",
+            f"Epilepsy: {epilepsy}",
+            f"Smell or taste disturbances: {smell_taste}" if nonempty(smell_taste) else "",
+            f"Frequency of colds: {colds}" if nonempty(colds) else "",
+        ],
+        "sec_respiratory": [
+            f"Sore throat in the morning: {throat_morning}",
+            f"Burning in the esophagus: {esophagus_burning}",
+            f"Diagnosed asthma: {asthma_dx}",
+            f"Pneumonia: {pneumonia}" + (f", {pneumonia_details}" if nonempty(pneumonia_details) else ""),
+            f"Shortness of breath: {dyspnea}" if nonempty(dyspnea) else "",
+            f"Waking at night due to shortness of breath: {night_breath}" if nonempty(night_breath) else "",
+            f"Chest heaviness: {chest_heaviness}" if nonempty(chest_heaviness) else "",
+            f"Breathing difficulty: {breathing_type}" if nonempty(breathing_type) else "",
+            f"Wheezing: {list_text(wheezing)}" if wheezing else "",
+            f"Cough: {cough}" if nonempty(cough) else "",
+        ],
+        "sec_cardio": [
+            f"Chest pain: {chest_pain}" if nonempty(chest_pain) else "",
+            f"Blood pressure problems: {pressure_type}" if nonempty(pressure_type) else "",
+            f"Current blood pressure: {current_bp}" if nonempty(current_bp) else "",
+            f"Current heart rate: {current_hr}" if nonempty(current_hr) else "",
+            f"Pain on palpation of the chest: {pain_press}",
+            f"Pain with change of body position: {pain_position}",
+            f"Palpitations: {palpitations}" if nonempty(palpitations) else "",
+        ],
+        "sec_gi": [
+            f"Gastrointestinal problems: {gi_problem}",
+            f"Symptoms: {list_text(gi_symptoms)}" if gi_symptoms else "",
+            f"Foods that worsen symptoms: {worsening_foods}" if nonempty(worsening_foods) else "",
+            f"Previous GI infections: {gi_infections}" if nonempty(gi_infections) else "",
+        ],
+        "sec_urinary": [
+            f"Urinary problems: {urine_problems}" if nonempty(urine_problems) else "",
+            f"Night urination count: {night_urination}" if nonempty(night_urination) else "",
+            f"Fluid intake: {fluids} liters" if nonempty(fluids) else "",
+        ],
+        "sec_msk": [
+            f"Joint pain: {joints}" if nonempty(joints) else "",
+            f"Pain or stiffness after getting out of bed: {stiffness}" if nonempty(stiffness) else "",
+        ],
+        "sec_skin": [
+            f"Skin changes: {skin_changes}" if nonempty(skin_changes) else "",
+            f"Itchy skin: {skin_itch}" if nonempty(skin_itch) else "",
+            f"Acne: {acne}" + (f", {acne_details}" if nonempty(acne_details) else ""),
+            f"Abnormal skin sensations: {skin_sensation}" if nonempty(skin_sensation) else "",
+            f"Wound healing problems: {wound_healing}" + (f", {wound_healing_details}" if nonempty(wound_healing_details) else ""),
+        ],
+        "sec_sleep_psych": [
+            f"Sleep problems: {sleep_problem}",
+            f"Types of sleep problems: {list_text(sleep_problem_types)}" if sleep_problem_types else "",
+            f"Psychologist or psychiatrist contact: {psych_contact}" if nonempty(psych_contact) else "",
+            f"Mental disorder diagnosis: {psych_dx}" if nonempty(psych_dx) else "",
+        ],
+        "sec_peripheral": [
+            f"Lower leg or ankle swelling: {edema}" + (f", {edema_details}" if nonempty(edema_details) else ""),
+            f"Calf pain when walking: {calf_pain}" if nonempty(calf_pain) else "",
+            f"Cold fingers or toes / discoloration: {cold_fingers}" if nonempty(cold_fingers) else "",
+            f"Tingling or numbness: {tingling}" if nonempty(tingling) else "",
+            f"Varicose veins: {varicose}" if nonempty(varicose) else "",
+        ],
+        "sec_anal": [
+            f"Anal area problems: {list_text(anal_problems)}" if anal_problems else "",
+            f"Other anal area problems: {anal_other}" if nonempty(anal_other) else "",
+        ],
+        "sec_sex_specific": [
+            f"Gynecological problems: {gyn_problems}" if nonempty(gyn_problems) else "",
+            f"Menstruation / menopause / hormonal treatment: {menstruation}" if nonempty(menstruation) else "",
+            f"First menstruation: {first_menses}" if nonempty(first_menses) else "",
+            f"Last menstrual period: {safe(last_menses)}" if nonempty(last_menses) else "",
+            f"Erectile dysfunction: {potency}" if nonempty(potency) else "",
+        ],
+        "sec_family": [
+            f"Mother: {mother_history}" if nonempty(mother_history) else "",
+            f"Father: {father_history}" if nonempty(father_history) else "",
+            f"Maternal grandmother: {maternal_grandmother}" if nonempty(maternal_grandmother) else "",
+            f"Paternal grandmother: {paternal_grandmother}" if nonempty(paternal_grandmother) else "",
+            f"Maternal grandfather: {maternal_grandfather}" if nonempty(maternal_grandfather) else "",
+            f"Paternal grandfather: {paternal_grandfather}" if nonempty(paternal_grandfather) else "",
+        ],
+        "sec_history_final": [
+            f"Previous diagnoses and surgeries: {own_diagnoses}" if nonempty(own_diagnoses) else "",
+            f"Important information for the doctor: {important_info}" if nonempty(important_info) else "",
+            f"Current reason for complaints: {current_reason}" if nonempty(current_reason) else "",
+        ],
+        "sec_question": [
+            f"Most important question: {key_question}" if nonempty(key_question) else "",
+        ],
+    }
+
+    try:
+        pdf_path = make_pdf(pdf_data)
+
+        subject = f"Medical Interview Report - {first_name_clean} {last_name_clean}"
+        body_text = (
+            "Attached is the medical interview report.\n\n"
+            f"Patient: {first_name_clean} {last_name_clean}\n"
+            f"Phone: {validated_phone}\n"
+            f"Email: {email_clean}\n"
+            f"Visit type: {visit_type}\n"
+            f"Submission date: {submitted_at}\n"
+        )
+
+        send_email_with_pdf(subject, body_text, pdf_path)
+
+        st.success("The form has been submitted successfully. The PDF report has been sent by email.")
+
+        st.markdown("<div class='summary-box'>", unsafe_allow_html=True)
+        st.write("### Summary")
+        st.write(f"**Patient:** {first_name_clean} {last_name_clean}")
+        st.write(f"**Phone number:** {validated_phone}")
+        st.write(f"**Email:** {email_clean}")
+        st.write(f"**Visit type:** {visit_type}")
+        st.write(f"**Main symptoms:** {', '.join(main_symptoms_list) if main_symptoms_list else 'No main symptoms entered'}")
+        st.write(f"**Current reason:** {current_reason if nonempty(current_reason) else 'Not provided'}")
+        st.write(f"**Most important question:** {key_question if nonempty(key_question) else 'Not provided'}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        st.download_button(
+            "Download PDF report",
+            data=pdf_bytes,
+            file_name="medical_interview_report.pdf",
+            mime="application/pdf",
+        )
+
+    except Exception as e:
+        st.error(f"An error occurred while generating or sending the PDF: {e}")
 
 if st.session_state.scroll_target:
     scroll_to_anchor(st.session_state.scroll_target)
